@@ -1,0 +1,92 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLESecurity.h>
+
+#define SERVICE_UUID         "600f00c4-591f-4c03-a01a-c7a29d6a6fe1"
+#define LED_CHAR_UUID        "8d310055-60fe-4774-a5b7-e3744632da7f"
+#define HEART_RATE_UUID      "00002a37-0000-1000-8000-00805f9b34fb"
+
+#define LED_PIN 2
+
+BLEServer* pServer = nullptr;
+BLEAdvertising* pAdvertising = nullptr;
+BLECharacteristic* pHeartRateChar = nullptr;
+
+unsigned long lastUpdateTime = 0;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    Serial.println("Client connected");
+  }
+  void onDisconnect(BLEServer* pServer) override {
+    Serial.println("Client disconnected");
+    pAdvertising->start();
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+
+  Serial.println("Starting BLE Server with encrypted characteristics");
+
+  BLEDevice::init("ESP32-KD");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Setup BLE Security for Just Works pairing with bonding 
+  BLESecurity *pSecurity = new BLESecurity();
+  pSecurity->setAuthenticationMode(ESP_LE_AUTH_BOND);  // Bonding + encryption, no MITM
+  pSecurity->setCapability(ESP_IO_CAP_NONE);           
+  pSecurity->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+
+  // Create BLE Service
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+
+  // LED Characteristic - Read-only, encrypted
+  BLECharacteristic* pLedChar = pService->createCharacteristic(
+    LED_CHAR_UUID,
+    BLECharacteristic::PROPERTY_READ
+  );
+  pLedChar->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED);
+  pLedChar->setValue("on");  // Initial LED state
+
+  // Heart Rate Characteristic - Read + Notify, encrypted
+  pHeartRateChar = pService->createCharacteristic(
+    HEART_RATE_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pHeartRateChar->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED);
+  pHeartRateChar->setValue("75");  // Initial BPM
+
+  pService->start();
+
+  // Start advertising
+  pAdvertising = pServer->getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
+  pAdvertising->start();
+
+  Serial.println("BLE Server started...");
+}
+
+void loop() {
+  delay(1000);
+
+  // Update heart rate every 60 seconds and notify clients
+  unsigned long currentTime = millis();
+  if (currentTime - lastUpdateTime >= 60000) {
+    int fakeBPM = random(60, 100);
+    String bpmStr = String(fakeBPM);
+    pHeartRateChar->setValue(bpmStr.c_str());
+    pHeartRateChar->notify();
+    Serial.printf("Heart rate updated to: %d bpm\n", fakeBPM);
+    lastUpdateTime = currentTime;
+  }
+}
