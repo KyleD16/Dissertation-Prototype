@@ -1,0 +1,182 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#define SERVICE_UUID         "600f00c4-591f-4c03-a01a-c7a29d6a6fe1"
+#define CHARACTERISTIC_UUID  "8d310055-60fe-4774-a5b7-e3744632da7f"
+#define HEART_RATE_UUID      "00002a37-0000-1000-8000-00805f9b34fb"
+#define LED_PIN 2
+
+BLEServer* pServer = nullptr;
+BLEAdvertising* pAdvertising = nullptr;
+BLECharacteristic* pHeartRateChar = nullptr;
+volatile int connectedDevices = 0;
+const int MAX_CONNECTIONS = 2;
+
+const char* whitelist[] = {"8C:68:8B:C1:2B:0B"};
+const int whitelistSize = sizeof(whitelist) / sizeof(whitelist[0]);
+
+unsigned long lastUpdateTime = 0;  // For timing heart rate updates
+unsigned long lastLogTime = 0;
+
+// Metrics tracking
+volatile unsigned long totalWriteLatencyUs = 0;
+volatile unsigned int writeCount = 0;
+volatile unsigned long writeBytes = 0;
+
+// Buffer drops
+#define BLE_BUFFER_SIZE 20
+QueueHandle_t bleWriteQueue;
+volatile unsigned int bleWriteDrops = 0;
+
+struct BleWriteData {
+    char value[32];
+};
+
+bool isInWhitelist(String mac) {
+    for (int i = 0; i < whitelistSize; i++) {
+        if (mac.equalsIgnoreCase(whitelist[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+class LedControlCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) override {
+        unsigned long startTime = micros();
+
+        String value = pCharacteristic->getValue();
+        writeBytes += value.length();
+
+        // Buffer for drop-only metrics
+        BleWriteData data;
+        value.toCharArray(data.value, sizeof(data.value));
+        if (xQueueSend(bleWriteQueue, &data, 0) != pdTRUE) {
+            bleWriteDrops++;
+        }
+
+        if (value == "on") {
+            digitalWrite(LED_PIN, HIGH);
+            Serial.println("LED turned ON");
+        } else if (value == "off") {
+            digitalWrite(LED_PIN, LOW);
+            Serial.println("LED turned OFF");
+        } else {
+            Serial.println("Invalid value received");
+        }
+
+        unsigned long latency = micros() - startTime;
+        totalWriteLatencyUs += latency;
+        writeCount++;
+    }
+};
+
+class MyServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) override {
+        // MAC whitelist logic
+        esp_bd_addr_t remote_bda;
+        memcpy(remote_bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+        char macStr[18];
+        snprintf(macStr, sizeof(macStr),
+                 "%02X:%02X:%02X:%02X:%02X:%02X",
+                 remote_bda, remote_bda[1], remote_bda,
+                 remote_bda, remote_bda, remote_bda);
+        String mac = String(macStr);
+        Serial.print("Device connected with MAC: ");
+        Serial.println(mac);
+
+        if (!isInWhitelist(mac)) {
+            Serial.println("Device not in whitelist. Disconnecting...");
+            pServer->disconnect(param->connect.conn_id);
+            return;
+        }
+
+        if (connectedDevices < MAX_CONNECTIONS) {
+            connectedDevices++;
+            Serial.printf("Device accepted! Total connected: %d\n", connectedDevices);
+        } else {
+            Serial.println("Maximum connections reached! Rejecting new device.");
+            pServer->disconnect(param->connect.conn_id);
+        }
+        pAdvertising->start();
+    }
+
+    void onDisconnect(BLEServer* pServer) override {
+        connectedDevices--;
+        Serial.printf("Device disconnected! Total connected: %d\n", connectedDevices);
+        delay(2000);
+        pAdvertising->start();
+    }
+};
+
+void setup() {
+    Serial.begin(115200);
+    delay(300);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH);
+    Serial.println("Starting BLE work!");
+
+    BLEDevice::init("ESP32-KD");
+    bleWriteQueue = xQueueCreate(BLE_BUFFER_SIZE, sizeof(BleWriteData));
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+
+    BLEService* pService = pServer->createService(SERVICE_UUID);
+
+    BLECharacteristic* pLedChar = pService->createCharacteristic(
+        CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+    );
+    pLedChar->setValue("on");
+    pLedChar->setCallbacks(new LedControlCallbacks());
+
+    pHeartRateChar = pService->createCharacteristic(
+        HEART_RATE_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+    );
+    pHeartRateChar->setValue("75");
+
+    pService->start();
+
+    pAdvertising = pServer->getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->setMinPreferred(0x06);
+    pAdvertising->setMinPreferred(0x12);
+    pAdvertising->start();
+
+    Serial.println("BLE Server is up. Ready for connections!");
+}
+
+void loop() {
+    unsigned long currentTime = millis();
+
+    // Log metrics every 3 seconds
+    if (currentTime - lastLogTime >= 3000) {
+        size_t freeHeap = esp_get_free_heap_size();
+        float avgLatency = (writeCount > 0) ? (totalWriteLatencyUs / (float)writeCount) : 0.0;
+        float throughput = writeBytes / 3.0;
+
+        Serial.printf("[METRICS] Free Heap: %u bytes | Buffer Drops: %u | Avg Write Latency: %.2f μs | Throughput: %.2f bytes/sec\n",
+                      freeHeap, bleWriteDrops, avgLatency, throughput);
+
+        writeBytes = 0;
+        lastLogTime = currentTime;
+    }
+
+    // Heart rate update every 60 seconds
+    if (currentTime - lastUpdateTime >= 60000 && pHeartRateChar != nullptr) {
+        int fakeBPM = random(60, 100);
+        String bpmStr = String(fakeBPM);
+        pHeartRateChar->setValue(bpmStr.c_str());
+        Serial.printf("Heart rate updated to: %d bpm\n", fakeBPM);
+        lastUpdateTime = currentTime;
+    }
+
+    delay(100);
+}
