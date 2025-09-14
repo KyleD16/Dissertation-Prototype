@@ -10,7 +10,7 @@ BLECharacteristic* pLedChar = nullptr;
 BLEServer* pServer = nullptr;
 BLEAdvertising* pAdvertising = nullptr;
 
-// 🛡️ Secure pairing callbacks
+// Secure pairing callbacks
 class MySecurity : public BLESecurityCallbacks {
   uint32_t onPassKeyRequest() override {
     return 123456;  // Static passkey for demonstration
