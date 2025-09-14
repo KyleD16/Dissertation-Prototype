@@ -1,2 +1,2 @@
 # Dissertation-Prototype
-Contains the Arduino scripts used in the implementation
+Contains the Bleak and Arduino scripts used in the implementation
